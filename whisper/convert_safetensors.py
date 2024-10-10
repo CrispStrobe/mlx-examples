@@ -7,7 +7,7 @@ import urllib
 import warnings
 from tqdm import tqdm
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -21,6 +21,18 @@ from mlx_whisper.whisper import ModelDimensions, AudioEncoder, TextDecoder, Whis
 import safetensors.torch  # Ensure safetensors is installed
 
 import gc
+import re  # Moved import here for quantize_model
+
+# Import for uploading
+from pathlib import Path
+from huggingface_hub import HfApi, ModelCard, logging as hf_logging
+
+# Initialize global verbose flag
+VERBOSE = False
+
+def debug_print(*args, **kwargs):
+    if VERBOSE:
+        print(*args, **kwargs)
 
 class CustomWhisper(nn.Module):
     def __init__(self, dims: ModelDimensions, dtype: mx.Dtype = mx.float16):
@@ -88,7 +100,7 @@ class CustomWhisper(nn.Module):
         # Cast audio_features to the desired dtype (float16)
         audio_features = audio_features.astype(self._dtype)
         # Debug print to verify dtype
-        print(f"embed_audio: dtype={audio_features.dtype}, type={type(audio_features)}")
+        debug_print(f"embed_audio: dtype={audio_features.dtype}, type={type(audio_features)}")
         return audio_features
 
     def logits(self, tokens, audio_features):
@@ -107,11 +119,11 @@ class CustomWhisper(nn.Module):
         # Handle specific parameter transformations if needed
         if 'decoder.token_embedding.weight' in params:
             weight = params['decoder.token_embedding.weight']
-            print("decoder.token_embedding.weight shape:", weight.shape)
+            debug_print("decoder.token_embedding.weight shape:", weight.shape)
 
             n_vocab, n_state = weight.shape
             if (n_vocab, n_state) != (self.dims.n_vocab, self.dims.n_text_state):
-                print(f"Transposing token embedding weights from shape {(n_vocab, n_state)} to {(self.dims.n_vocab, self.dims.n_text_state)}")
+                debug_print(f"Transposing token embedding weights from shape {(n_vocab, n_state)} to {(self.dims.n_vocab, self.dims.n_text_state)}")
                 weight = weight.T
                 params['decoder.token_embedding.weight'] = weight
 
@@ -120,7 +132,7 @@ class CustomWhisper(nn.Module):
             
             if 'conv' in param_name and 'weight' in param_name:
                 # Do NOT transpose the weights for convolution layers
-                print(f"Conv weight {param_name}: shape {param_value.shape}")
+                debug_print(f"Conv weight {param_name}: shape {param_value.shape}")
 
             parts = param_name.split('.')
             module = self  # Start from the root module (self)
@@ -152,26 +164,24 @@ class CustomWhisper(nn.Module):
 
                 # Assign the parameter to the final attribute
                 setattr(module, parts[-1], param_value)
-                print(f"Assigned parameter '{param_name}' with shape {param_value.shape} and dtype {param_value.dtype}")
+                debug_print(f"Assigned parameter '{param_name}' with shape {param_value.shape} and dtype {param_value.dtype}")
             except AttributeError as e:
-                print(f"Error assigning parameter '{param_name}': {e}")
+                debug_print(f"Error assigning parameter '{param_name}': {e}")
                 raise e
             except IndexError as e:
-                print(f"Error assigning parameter '{param_name}': {e}")
+                debug_print(f"Error assigning parameter '{param_name}': {e}")
                 raise e
 
             # Free memory after assignment to prevent memory bloat
             del param_value
             gc.collect()
 
-
-
 def debug_model_dtypes(model: CustomWhisper):
-    print("Debugging model dtypes and shapes:")
-    print(f"Encoder conv1.weight dtype: {model.encoder.conv1.weight.dtype}, shape: {model.encoder.conv1.weight.shape}")
-    print(f"Encoder blocks[0].attn.query.weight dtype: {model.encoder.blocks[0].attn.query.weight.dtype}, shape: {model.encoder.blocks[0].attn.query.weight.shape}")
-    print(f"Decoder blocks[0].attn.query.weight dtype: {model.decoder.blocks[0].attn.query.weight.dtype}, shape: {model.decoder.blocks[0].attn.query.weight.shape}")
-    print(f"Decoder token_embedding.weight dtype: {model.decoder.token_embedding.weight.dtype}, shape: {model.decoder.token_embedding.weight.shape}")
+    debug_print("Debugging model dtypes and shapes:")
+    debug_print(f"Encoder conv1.weight dtype: {model.encoder.conv1.weight.dtype}, shape: {model.encoder.conv1.weight.shape}")
+    debug_print(f"Encoder blocks[0].attn.query.weight dtype: {model.encoder.blocks[0].attn.query.weight.dtype}, shape: {model.encoder.blocks[0].attn.query.weight.shape}")
+    debug_print(f"Decoder blocks[0].attn.query.weight dtype: {model.decoder.blocks[0].attn.query.weight.dtype}, shape: {model.decoder.blocks[0].attn.query.weight.shape}")
+    debug_print(f"Decoder token_embedding.weight dtype: {model.decoder.token_embedding.weight.dtype}, shape: {model.decoder.token_embedding.weight.shape}")
 
 def map_state_dict(state_dict: Dict[str, torch.Tensor], dtype: np.dtype) -> Dict[str, np.ndarray]:
     mapped_dict = {}
@@ -188,14 +198,14 @@ def map_state_dict(state_dict: Dict[str, torch.Tensor], dtype: np.dtype) -> Dict
         if k in specific_mappings:
             new_k = specific_mappings[k]
             mapped_dict[new_k] = v.detach().cpu().numpy().astype(dtype)
-            print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
+            debug_print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
             continue  # Proceed to next parameter
 
         # Dynamic Handling for MLP's proj_out
         if '.mlp.proj_out.' in k:
             new_k = k.replace('.mlp.proj_out.', '.mlp2.')
             mapped_dict[new_k] = v.detach().cpu().numpy().astype(dtype)
-            print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
+            debug_print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
             continue
 
         # General Replacement: Replace 'proj_out' with 'out' in all keys
@@ -230,11 +240,11 @@ def map_state_dict(state_dict: Dict[str, torch.Tensor], dtype: np.dtype) -> Dict
                     # Transpose Conv1d weights from (C_out, C_in, K) to (C_out, K, C_in)
                     mapped_weight = v.detach().cpu().numpy().astype(dtype).transpose(0, 2, 1)
                     mapped_dict[new_k] = mapped_weight
-                    print(f"Mapped {k} to {new_k} with transposition: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
+                    debug_print(f"Mapped {k} to {new_k} with transposition: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
                 else:
                     # Biases or other conv parameters
                     mapped_dict[new_k] = v.detach().cpu().numpy().astype(dtype)
-                    print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
+                    debug_print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
                 continue
             elif 'embed_positions' in new_k:
                 new_k = new_k.replace('embed_positions.weight', '_positional_embedding')
@@ -287,14 +297,14 @@ def map_state_dict(state_dict: Dict[str, torch.Tensor], dtype: np.dtype) -> Dict
         # Assign other weights directly
         if new_k not in mapped_dict:
             mapped_dict[new_k] = v.detach().cpu().numpy().astype(dtype)
-            print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
+            debug_print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
 
     # Identify any unmapped 'proj_out' parameters for debugging
     unmapped_proj_out = [k for k in state_dict.keys() if 'proj_out' in k and k not in specific_mappings]
     if unmapped_proj_out:
-        print("Warning: The following 'proj_out' parameters were not specifically mapped and have been replaced with 'out':")
+        debug_print("Warning: The following 'proj_out' parameters were not specifically mapped and have been replaced with 'out':")
         for k in unmapped_proj_out:
-            print(f"  Original key: {k} --> Mapped key: {k.replace('proj_out.', 'out.').replace('.proj_out', '.out').replace('proj_out', 'out')}")
+            debug_print(f"  Original key: {k} --> Mapped key: {k.replace('proj_out.', 'out.').replace('.proj_out', '.out').replace('proj_out', 'out')}")
 
     # Final Check: Ensure no 'proj_out' remains
     final_proj_out = [k for k in mapped_dict.keys() if 'proj_out' in k]
@@ -302,7 +312,6 @@ def map_state_dict(state_dict: Dict[str, torch.Tensor], dtype: np.dtype) -> Dict
         raise ValueError(f"After mapping, the following parameters still contain 'proj_out': {final_proj_out}")
 
     return mapped_dict
-
 
 def load_torch_model(name_or_path: str, download_root: str = None, dtype: mx.Dtype = mx.float16) -> CustomWhisper:
     def transpose_conv_weights(mapped_state_dict):
@@ -316,18 +325,18 @@ def load_torch_model(name_or_path: str, download_root: str = None, dtype: mx.Dty
 
     # Load the model using Transformers or safetensors
     if name_or_path.endswith(".safetensors"):
-        print(f"Loading safetensors model from {name_or_path}")
+        debug_print(f"Loading safetensors model from {name_or_path}")
         state_dict = safetensors.torch.load_file(name_or_path, device='cpu')
         # After loading the state_dict
         proj_out_params = [k for k in state_dict.keys() if 'proj_out' in k]
-        print(f"Found {len(proj_out_params)} parameters containing 'proj_out':")
+        debug_print(f"Found {len(proj_out_params)} parameters containing 'proj_out':")
         for p in proj_out_params:
-            print(f"  {p}")
+            debug_print(f"  {p}")
 
         hf_model = WhisperForConditionalGeneration.from_pretrained(name_or_path)
         config = hf_model.config
     else:
-        print(f"Loading PyTorch model from {name_or_path}")
+        debug_print(f"Loading PyTorch model from {name_or_path}")
         hf_model = WhisperForConditionalGeneration.from_pretrained(name_or_path, device_map='cpu')
         state_dict = hf_model.state_dict()
         config = hf_model.config
@@ -335,18 +344,18 @@ def load_torch_model(name_or_path: str, download_root: str = None, dtype: mx.Dty
     # Verify the original Conv1D weight shape
     original_conv1_shape = state_dict.get('model.encoder.conv1.weight', None)
     if original_conv1_shape is not None:
-        print(f"Original 'model.encoder.conv1.weight' shape: {original_conv1_shape.shape}")
+        debug_print(f"Original 'model.encoder.conv1.weight' shape: {original_conv1_shape.shape}")
     else:
         raise KeyError("model.encoder.conv1.weight not found in state_dict")
 
     # Print configuration to verify correctness
-    print(f"Config num_mel_bins: {config.num_mel_bins}")
-    print(f"Config d_model: {config.d_model}")
-    print(f"Config encoder_attention_heads: {config.encoder_attention_heads}")
-    print(f"Config encoder_layers: {config.encoder_layers}")
-    print(f"Config decoder_attention_heads: {config.decoder_attention_heads}")
-    print(f"Config decoder_layers: {config.decoder_layers}")
-    print(f"Config vocab_size: {config.vocab_size}")
+    debug_print(f"Config num_mel_bins: {config.num_mel_bins}")
+    debug_print(f"Config d_model: {config.d_model}")
+    debug_print(f"Config encoder_attention_heads: {config.encoder_attention_heads}")
+    debug_print(f"Config encoder_layers: {config.encoder_layers}")
+    debug_print(f"Config decoder_attention_heads: {config.decoder_attention_heads}")
+    debug_print(f"Config decoder_layers: {config.decoder_layers}")
+    debug_print(f"Config vocab_size: {config.vocab_size}")
 
     # Extract model dimensions using the imported ModelDimensions
     dims = ModelDimensions(
@@ -362,14 +371,14 @@ def load_torch_model(name_or_path: str, download_root: str = None, dtype: mx.Dty
         n_text_layer=config.decoder_layers
     )
 
-    print(f"Model Dimensions: {dims}")
+    debug_print(f"Model Dimensions: {dims}")
 
     # Create a CustomWhisper model instance
-    print ("CustomWhisper initialized with:", dtype)
+    debug_print("CustomWhisper initialized with:", dtype)
     model = CustomWhisper(dims, dtype=dtype)
     model = model.astype(dtype)  # Use the updated astype method
 
-    print(f"Number of mel bins (n_mels): {model.dims.n_mels}")
+    debug_print(f"Number of mel bins (n_mels): {model.dims.n_mels}")
 
     # Map the state dict
     np_dtype = np.float16 if dtype == mx.float16 else np.float32
@@ -381,57 +390,56 @@ def load_torch_model(name_or_path: str, download_root: str = None, dtype: mx.Dty
     # After mapping, check for any remaining 'proj_out' in the mapped keys
     remaining_proj_out = [k for k in mapped_state_dict.keys() if 'proj_out' in k]
     if remaining_proj_out:
-        print("Warning: The following parameters still contain 'proj_out' and may not be correctly mapped:")
+        debug_print("Warning: The following parameters still contain 'proj_out' and may not be correctly mapped:")
         for k in remaining_proj_out:
-            print(f"  {k}")
+            debug_print(f"  {k}")
 
     # Convert numpy arrays to MLX arrays
     mlx_state_dict = {}
     for k, v in mapped_state_dict.items():
         mlx_state_dict[k] = mx.array(v, dtype=dtype)
-        print(f"Converted {k} to MLX array: shape {v.shape}, dtype {v.dtype}")
+        debug_print(f"Converted {k} to MLX array: shape {v.shape}, dtype {v.dtype}")
 
     # After creating the model instance
-    print("Model created. Debugging shapes:")
-    print(f"encoder.conv1.weight shape: {model.encoder.conv1.weight.shape}")  # Expected: (1280, 128, 3)
-    print(f"encoder.conv2.weight shape: {model.encoder.conv2.weight.shape}")  # Expected: (1280, 1280, 3)
-    print(f"decoder.token_embedding.weight shape: {model.decoder.token_embedding.weight.shape}")  # Expected: (51866, 1280)
+    debug_print("Model created. Debugging shapes:")
+    debug_print(f"encoder.conv1.weight shape: {model.encoder.conv1.weight.shape}")  # Expected: (1280, 128, 3)
+    debug_print(f"encoder.conv2.weight shape: {model.encoder.conv2.weight.shape}")  # Expected: (1280, 1280, 3)
+    debug_print(f"decoder.token_embedding.weight shape: {model.decoder.token_embedding.weight.shape}")  # Expected: (51866, 1280)
 
     # Update model parameters without transposing convolutional weights
     model.update(mlx_state_dict)
 
     # Detailed debugging
-    print("Model dtype after update:", model.dtype)
-    print("Encoder conv1.weight dtype:", model.encoder.conv1.weight.dtype)
-    print("Encoder conv1.weight shape:", model.encoder.conv1.weight.shape)
-    print(f"encoder.conv2.weight shape: {model.encoder.conv2.weight.shape}")
-    print(f"decoder.token_embedding.weight shape: {model.decoder.token_embedding.weight.shape}")
+    debug_print("Model dtype after update:", model.dtype)
+    debug_print("Encoder conv1.weight dtype:", model.encoder.conv1.weight.dtype)
+    debug_print("Encoder conv1.weight shape:", model.encoder.conv1.weight.shape)
+    debug_print(f"encoder.conv2.weight shape: {model.encoder.conv2.weight.shape}")
+    debug_print(f"decoder.token_embedding.weight shape: {model.decoder.token_embedding.weight.shape}")
 
-    print("Decoder blocks[0].attn.query.weight dtype:", model.decoder.blocks[0].attn.query.weight.dtype)
-    print("Decoder blocks[0].attn.query.weight shape:", model.decoder.blocks[0].attn.query.weight.shape)
+    debug_print("Decoder blocks[0].attn.query.weight dtype:", model.decoder.blocks[0].attn.query.weight.dtype)
+    debug_print("Decoder blocks[0].attn.query.weight shape:", model.decoder.blocks[0].attn.query.weight.shape)
 
     # Create dummy input with shape (batch_size, sequence_length, channels)
     dummy_input_length = 3000  # Must be <= n_audio_ctx
     dummy_input = mx.random.normal((1, dummy_input_length, model.dims.n_mels))  # Shape: (1, 3000, 128)
-    print(f"Dummy input shape: {dummy_input.shape}")  # Should be (1, 3000, 128)
+    debug_print(f"Dummy input shape: {dummy_input.shape}")  # Should be (1, 3000, 128)
 
     # Verify input channels
     expected_in_channels = model.encoder.conv1.weight.shape[2]  # C_in=128
     actual_in_channels = dummy_input.shape[2]  # C_in=128
-    print(f"Expected input channels: {expected_in_channels}, Actual input channels: {actual_in_channels}")
+    debug_print(f"Expected input channels: {expected_in_channels}, Actual input channels: {actual_in_channels}")
     if actual_in_channels != expected_in_channels:
         raise ValueError(f"Input channels mismatch: expected {expected_in_channels}, got {actual_in_channels}")
 
     # Embed audio and check output
     try:
         audio_features = model.embed_audio(dummy_input)
-        print(f"Audio features dtype after loading: {audio_features.dtype}, shape: {audio_features.shape}")
+        debug_print(f"Audio features dtype after loading: {audio_features.dtype}, shape: {audio_features.shape}")
     except Exception as e:
-        print(f"Error during embed_audio: {e}")
+        debug_print(f"Error during embed_audio: {e}")
         raise e
 
     return model
-
 
 def quantize_weights(weights, group_size, bits):
     """
@@ -470,6 +478,9 @@ def quantize_weights(weights, group_size, bits):
         for i in range(flat_weights.size):
             bit_position = (i * bits) % 32
             array_index = (i * bits) // 32
+            if array_index >= packed.size:
+                # Prevent out-of-bounds in case of overflow
+                break
             packed[array_index] |= (flat_weights[i] & ((1 << bits) - 1)) << bit_position
         return packed
 
@@ -524,20 +535,16 @@ def quantize_model(model, group_size, bits):
     """
     Quantize linear layers in the model, except for those affecting audio_features.
     """
-    import re  # Ensure regex is imported at the top
 
     modules = list(model.named_modules())
 
     # Early check
-    print("Before quantization:")
+    debug_print("Before quantization:")
     debug_model_dtypes(model)
 
     pbar = tqdm(total=len(modules), desc="Quantizing layers")
 
     for name, module in modules:
-        #if isinstance(module, nn.Module):
-        #    module = module.astype(mx.float16)
-        
         # Define regex patterns for layers to skip quantization
         skip_patterns = [
             r'^encoder\.blocks\.\d+\.attn\.query$',  # e.g., encoder.blocks.0.attn.query
@@ -582,20 +589,19 @@ def quantize_model(model, group_size, bits):
 
     pbar.close()
 
-    print("After quantization:")
+    debug_print("After quantization:")
     debug_model_dtypes(model)
 
     # Check if encoder output dtype is correct
     dummy_input = mx.random.normal((1, model.dims.n_mels, 3000)).transpose(0, 2, 1)  # Shape: (1, 3000, 128)
     encoder_output = model.encoder(dummy_input)
-    print(f"Encoder output dtype: {encoder_output.dtype}")
+    debug_print(f"Encoder output dtype: {encoder_output.dtype}")
 
     # Check audio features dtype
     audio_features = model.embed_audio(dummy_input)
-    print(f"Audio features dtype after quantization: {audio_features.dtype}")
+    debug_print(f"Audio features dtype after quantization: {audio_features.dtype}")
 
     return model
-
 
 def quantize(model, args):
     # Quantize the model:
@@ -614,43 +620,96 @@ def quantize(model, args):
     for key, value in tree_flatten(params_dict):
         weights[key] = value
 
-    print("After quantization:")
+    debug_print("After quantization:")
     debug_model_dtypes(quantized_model)
 
     # Check if encoder output dtype is correct
     dummy_input = mx.random.normal((1, quantized_model.dims.n_mels, 3000)).transpose(0, 2, 1)  # (1, 3000, 80)
     encoder_output = quantized_model.encoder(dummy_input)
-    print(f"Encoder output dtype: {encoder_output.dtype}")
+    debug_print(f"Encoder output dtype: {encoder_output.dtype}")
 
     # Check audio features dtype
     audio_features = quantized_model.embed_audio(dummy_input)
-    print(f"Audio features dtype after quantization: {audio_features.dtype}")
+    debug_print(f"Audio features dtype after quantization: {audio_features.dtype}")
 
     return weights, quantized_config
+
+def upload_to_hub(path: str, name: str, torch_name_or_path: str):
+    """
+    Upload the MLX model to Hugging Face Hub.
+    
+    Parameters:
+    - path: Path to the MLX model directory.
+    - name: Name of the repository on Hugging Face Hub.
+    - torch_name_or_path: The original Torch model name or path.
+    """
+    import os
+
+    repo_id = f"mlx-community/{name}"
+    text = f"""---
+library_name: mlx
+---
+
+# {name}
+This model was converted to MLX format from [`{torch_name_or_path}`]().
+
+## Use with MLX
+```bash
+git clone https://github.com/ml-explore/mlx-examples.git
+cd mlx-examples/whisper/
+pip install -r requirements.txt
+
+>> import whisper
+>> whisper.transcribe("FILE_NAME")
+"""
+    # Create README.md
+    readme_path = os.path.join(path, "README.md")
+    with open(readme_path, "w") as f:
+        f.write(text)
+
+    # Set logging to info
+    hf_logging.set_verbosity_info()
+
+    api = HfApi()
+    try:
+        # Create repository
+        api.create_repo(repo_id=repo_id, exist_ok=True)
+        debug_print(f"Repository {repo_id} created or already exists.")
+
+        # Upload folder
+        api.upload_folder(
+            folder_path=path,
+            repo_id=repo_id,
+            repo_type="model",
+        )
+        print(f"Model uploaded to https://huggingface.co/{repo_id}")
+    except Exception as e:
+        print(f"Failed to upload to Hugging Face Hub: {e}")
 
 if __name__ == "__main__":
     
     def test_encoder(model):
-        print("Testing encoder...")
+        debug_print("Testing encoder...")
         dummy_input_length = 3000
         dummy_input = mx.random.normal((1, dummy_input_length, model.dims.n_mels))  # (1, 3000, 128)
-        print(f"Original dummy input shape: {dummy_input.shape}")
+        debug_print(f"Original dummy input shape: {dummy_input.shape}")
 
         # Verify input channels
         expected_in_channels = model.encoder.conv1.weight.shape[2]
         actual_in_channels = dummy_input.shape[2]
-        print(f"Expected input channels: {expected_in_channels}, Actual input channels: {actual_in_channels}")
+        debug_print(f"Expected input channels: {expected_in_channels}, Actual input channels: {actual_in_channels}")
         if actual_in_channels != expected_in_channels:
             raise ValueError(f"Input channels mismatch: expected {expected_in_channels}, got {actual_in_channels}")
 
         try:
             encoder_output = model.encoder(dummy_input)
-            print(f"Encoder output shape: {encoder_output.shape}")
-            print("Encoder test successful!")
+            debug_print(f"Encoder output shape: {encoder_output.shape}")
+            debug_print("Encoder test successful!")
         except Exception as e:
             print(f"Encoder test failed: {str(e)}")
 
-    
+def main(): 
+    global VERBOSE
     parser = argparse.ArgumentParser(description="Convert Whisper weights to MLX.")
     parser.add_argument(
         "--torch-name-or-path",
@@ -688,15 +747,27 @@ if __name__ == "__main__":
         type=int,
         default=4,
     )
+    parser.add_argument(
+        "--upload-name",
+        help="The name of model to upload to Hugging Face MLX Community",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--verbose",
+        help="Enable verbose debug output.",
+        action="store_true",
+    )
 
     args = parser.parse_args()
+    VERBOSE = args.verbose
+
     assert args.dtype in ["float16", "float32"], f"dtype {args.dtype} not supported"
     dtype = getattr(mx, args.dtype)
-    print(f"Using dtype: {dtype}")
+    debug_print(f"Using dtype: {dtype}")
 
     print("[INFO] Loading")
     model = load_torch_model(args.torch_name_or_path, dtype=dtype)
-    print(f"Model dtype after loading: {model.dtype}")
     debug_model_dtypes(model)  # Updated from model.whisper to model
 
     test_encoder(model)
@@ -704,28 +775,27 @@ if __name__ == "__main__":
     # Adjust the dummy input length to 3000
     dummy_input_length = 3000  # Adjusted to match input length that results in output length matching n_audio_ctx
     dummy_input = mx.random.normal((1, dummy_input_length, model.dims.n_mels))  # Shape: (1, 3000, 128)
-    print(f"Dummy input shape: {dummy_input.shape}")  # Should be (1, 3000, 128)
+    debug_print(f"Dummy input shape: {dummy_input.shape}")  # Should be (1, 3000, 128)
 
     # Verify input channels
     expected_in_channels = model.encoder.conv1.weight.shape[2]  # in_channels=128
     actual_in_channels = dummy_input.shape[2]
-    print(f"Expected input channels: {expected_in_channels}, Actual input channels: {actual_in_channels}")
+    debug_print(f"Expected input channels: {expected_in_channels}, Actual input channels: {actual_in_channels}")
     if actual_in_channels != expected_in_channels:
         raise ValueError(f"Input channels mismatch: expected {expected_in_channels}, got {actual_in_channels}")
 
     # Embed audio and check output
     try:
         audio_features = model.embed_audio(dummy_input)
-        print(f"Audio features dtype after loading: {audio_features.dtype}, shape: {audio_features.shape}")
+        debug_print(f"Audio features dtype after loading: {audio_features.dtype}, shape: {audio_features.shape}")
     except Exception as e:
-        print(f"Error during embed_audio: {e}")
+        debug_print(f"Error during embed_audio: {e}")
         raise e
 
     config = vars(model.dims)
 
     if args.quantize:
         print("[INFO] Quantizing")
-        model = quantize_model(model, args.q_group_size, args.q_bits)
         weights, config = quantize(model, args)
     else:
         # Collect the weights
@@ -746,4 +816,11 @@ if __name__ == "__main__":
         config["model_type"] = "whisper"
         json.dump(config, f, indent=4)
 
+    if args.upload_name is not None:
+        print("[INFO] Uploading to Hugging Face Hub")
+        upload_to_hub(mlx_path, args.upload_name, args.torch_name_or_path)
+
     print("[INFO] Conversion complete")
+
+if __name__ == "__main__":
+    main()
