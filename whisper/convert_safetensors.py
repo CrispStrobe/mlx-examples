@@ -34,20 +34,55 @@ def debug_print(*args, **kwargs):
     if VERBOSE:
         print(*args, **kwargs)
 
+def get_dtype(dtype_str):
+    dtype_mapping = {
+        "float16": (mx.float16, np.float16),
+        "float32": (mx.float32, np.float32),
+    }
+    if dtype_str not in dtype_mapping:
+        raise ValueError(f"dtype {dtype_str} not supported. Choose from {list(dtype_mapping.keys())}.")
+    return dtype_mapping[dtype_str]
+
+class FloatLayerNorm(nn.LayerNorm):
+    def __init__(self, normalized_shape, eps=1e-5, original_layer=None, dtype=mx.float16):
+        super().__init__(normalized_shape, eps=eps)
+        self.dtype = dtype
+        if original_layer is not None:
+            # Cast weight and bias to the desired dtype
+            self.weight = original_layer.weight.astype(dtype)
+            self.bias = original_layer.bias.astype(dtype)
+
+    def __call__(self, x):
+        # Ensure input is cast to the desired dtype
+        x = x.astype(self.dtype)
+        return super().__call__(x)
+
+class CustomAudioEncoder(AudioEncoder):
+    def __init__(self, *args, dtype=mx.float16, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dtype = dtype  # Store the desired dtype
+
+    def __call__(self, x):
+        audio_features = super().__call__(x)
+        audio_features = audio_features.astype(self.dtype)
+        debug_print(f"CustomAudioEncoder output dtype: {audio_features.dtype}")
+        return audio_features
+
 class CustomWhisper(nn.Module):
-    def __init__(self, dims: ModelDimensions, dtype: mx.Dtype = mx.float16):
+
+    def __init__(self, dims: ModelDimensions, dtype=mx.float16):
         super().__init__()
         self.dims = dims
         self._dtype = dtype  # Initialize _dtype
 
-        # Initialize encoder and decoder directly
-        self.encoder = AudioEncoder(
+        # Initialize encoder with CustomAudioEncoder
+        self.encoder = CustomAudioEncoder(
             self.dims.n_mels,
             self.dims.n_audio_ctx,
             self.dims.n_audio_state,
             self.dims.n_audio_head,
             self.dims.n_audio_layer,
-            dtype,
+            dtype=dtype,
         )
         self.decoder = TextDecoder(
             self.dims.n_vocab,
@@ -55,10 +90,10 @@ class CustomWhisper(nn.Module):
             self.dims.n_text_state,
             self.dims.n_text_head,
             self.dims.n_text_layer,
-            dtype,
+            dtype=dtype,
         )
         
-        # Alignment heads are in float32, but should not affect audio_features
+        # Alignment heads remain unchanged
         all_heads = np.zeros(
             (self.dims.n_text_layer, self.dims.n_text_head), dtype=bool
         )
@@ -69,44 +104,84 @@ class CustomWhisper(nn.Module):
     def dtype(self):
         return self._dtype
 
+    def forward_with_cross_qk(self, mel, tokens):
+        # Ensure mel is cast to the desired dtype
+        mel = mel.astype(self._dtype)
+        audio_features = self.encoder(mel).astype(self._dtype)
+        return self.decoder(tokens, audio_features)[0].astype(self._dtype)
+
     def astype(self, dtype):
+        """
+        Casts model parameters to the specified dtype.
+
+        Args:
+            dtype (mx.Dtype): The target dtype (e.g., mx.float16, mx.float32).
+        """
         self._dtype = dtype
-        # Recursively apply the dtype change to all submodules
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 module.weight = module.weight.astype(dtype)
+                debug_print(f"Cast nn.Linear layer '{name}.weight' to {dtype}.")
                 if hasattr(module, 'bias') and module.bias is not None:
                     module.bias = module.bias.astype(dtype)
-            elif isinstance(module, nn.LayerNorm):
+                    debug_print(f"Cast nn.Linear layer '{name}.bias' to {dtype}.")
+
+            elif isinstance(module, QuantizedLinear):
+                # QuantizedLinear.weight should remain as uint32, do not cast
+                # Only cast bias if present
+                if hasattr(module, 'bias') and module.bias is not None:
+                    module.bias = module.bias.astype(dtype)
+                    debug_print(f"Cast QuantizedLinear layer '{name}.bias' to {dtype}.")
+
+            elif isinstance(module, FloatLayerNorm):
                 module.weight = module.weight.astype(dtype)
+                debug_print(f"Cast FloatLayerNorm layer '{name}.weight' to {dtype}.")
                 module.bias = module.bias.astype(dtype)
+                debug_print(f"Cast FloatLayerNorm layer '{name}.bias' to {dtype}.")
+
             elif isinstance(module, nn.Conv1d):
                 module.weight = module.weight.astype(dtype)
+                debug_print(f"Cast nn.Conv1d layer '{name}.weight' to {dtype}.")
                 if hasattr(module, 'bias') and module.bias is not None:
                     module.bias = module.bias.astype(dtype)
+                    debug_print(f"Cast nn.Conv1d layer '{name}.bias' to {dtype}.")
+
             elif isinstance(module, nn.Embedding):
                 module.weight = module.weight.astype(dtype)
-        
-        # Handle special cases
-        self.encoder._positional_embedding = self.encoder._positional_embedding.astype(dtype)
-        self.decoder.positional_embedding = self.decoder.positional_embedding.astype(dtype)
-        self.decoder._mask = self.decoder._mask.astype(dtype)
-        
+                debug_print(f"Cast nn.Embedding layer '{name}.weight' to {dtype}.")
+
+            # Add additional layer types if necessary
+
+        # Handle special buffers with detailed debug prints
+        if hasattr(self.encoder, '_positional_embedding'):
+            self.encoder._positional_embedding = self.encoder._positional_embedding.astype(dtype)
+            debug_print(f"encoder._positional_embedding dtype after cast: {self.encoder._positional_embedding.dtype}")
+
+        if hasattr(self.decoder, 'positional_embedding'):
+            self.decoder.positional_embedding = self.decoder.positional_embedding.astype(dtype)
+            debug_print(f"decoder.positional_embedding dtype after cast: {self.decoder.positional_embedding.dtype}")
+
+        if hasattr(self.decoder, '_mask'):
+            self.decoder._mask = self.decoder._mask.astype(dtype)
+            debug_print(f"decoder._mask dtype after cast: {self.decoder._mask.dtype}")
+
         return self
 
+
     def embed_audio(self, mel):
-        # Ensure mel has shape (N, L, C)
+        debug_print(f"Input dtype: {mel.dtype}")
         audio_features = self.encoder(mel)
-        # Cast audio_features to the desired dtype (float16)
+        debug_print(f"After encoder, dtype: {audio_features.dtype}")
+        # Cast audio_features to the desired dtype
         audio_features = audio_features.astype(self._dtype)
-        # Debug print to verify dtype
-        debug_print(f"embed_audio: dtype={audio_features.dtype}, type={type(audio_features)}")
+        debug_print(f"After casting, dtype: {audio_features.dtype}, type: {type(audio_features)}")
         return audio_features
+
 
     def logits(self, tokens, audio_features):
         return self.decoder(tokens, audio_features)[0]
 
-    def forward_with_cross_qk(self, mel, tokens):
+    def forward_with_cross_qk_old(self, mel, tokens):
         return self.decoder(tokens, self.encoder(mel))
 
     def decode(self, *args, **kwargs):
@@ -182,8 +257,41 @@ def debug_model_dtypes(model: CustomWhisper):
     debug_print(f"Encoder blocks[0].attn.query.weight dtype: {model.encoder.blocks[0].attn.query.weight.dtype}, shape: {model.encoder.blocks[0].attn.query.weight.shape}")
     debug_print(f"Decoder blocks[0].attn.query.weight dtype: {model.decoder.blocks[0].attn.query.weight.dtype}, shape: {model.decoder.blocks[0].attn.query.weight.shape}")
     debug_print(f"Decoder token_embedding.weight dtype: {model.decoder.token_embedding.weight.dtype}, shape: {model.decoder.token_embedding.weight.shape}")
+    # Add checks for weightss
+    for name, module in model.named_modules():
+        if hasattr(module, 'weight'):
+            debug_print(f"{name}: dtype={module.weight.dtype}")
 
-def map_state_dict(state_dict: Dict[str, torch.Tensor], dtype: np.dtype) -> Dict[str, np.ndarray]:
+def replace_layer_norms(module, dtype):
+    for name, child in module.named_modules():
+        if isinstance(child, nn.LayerNorm):
+            # Split the module's full name to get parent path and attribute name
+            if '.' in name:
+                parent_name, attr_name = name.rsplit('.', 1)
+                parent_module = get_submodule(module, parent_name.split('.'))
+            else:
+                parent_module = module
+                attr_name = name
+
+            # Use child.weight.shape as the normalized_shape
+            normalized_shape = child.weight.shape
+
+            # If normalized_shape is a single-element tuple, convert it to int
+            if isinstance(normalized_shape, tuple) and len(normalized_shape) == 1:
+                normalized_shape = normalized_shape[0]
+                debug_print(f"Converted normalized_shape for '{name}': {normalized_shape}")
+            else:
+                # Keep as is for multi-dimensional LayerNorm
+                debug_print(f"Keeping normalized_shape for '{name}': {normalized_shape}")
+
+            # Create a FloatLayerNorm instance with the same parameters
+            new_layer_norm = FloatLayerNorm(normalized_shape, child.eps, original_layer=child, dtype=dtype)
+
+            # Replace the LayerNorm with FloatLayerNorm
+            set_submodule(module, name.split('.'), new_layer_norm)
+            debug_print(f"Replaced LayerNorm at '{name}' with FloatLayerNorm.")
+
+def map_state_dict(state_dict: Dict[str, torch.Tensor], np_dtype: np.dtype) -> Dict[str, np.ndarray]:
     mapped_dict = {}
     specific_mappings = {
         'proj_out.weight': 'decoder.token_embedding.weight',
@@ -197,14 +305,14 @@ def map_state_dict(state_dict: Dict[str, torch.Tensor], dtype: np.dtype) -> Dict
         # Specific Mappings
         if k in specific_mappings:
             new_k = specific_mappings[k]
-            mapped_dict[new_k] = v.detach().cpu().numpy().astype(dtype)
+            mapped_dict[new_k] = v.detach().cpu().numpy().astype(np_dtype)
             debug_print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
             continue  # Proceed to next parameter
 
         # Dynamic Handling for MLP's proj_out
         if '.mlp.proj_out.' in k:
             new_k = k.replace('.mlp.proj_out.', '.mlp2.')
-            mapped_dict[new_k] = v.detach().cpu().numpy().astype(dtype)
+            mapped_dict[new_k] = v.detach().cpu().numpy().astype(np_dtype)
             debug_print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
             continue
 
@@ -238,12 +346,12 @@ def map_state_dict(state_dict: Dict[str, torch.Tensor], dtype: np.dtype) -> Dict
             elif 'conv' in new_k:
                 if 'weight' in new_k:
                     # Transpose Conv1d weights from (C_out, C_in, K) to (C_out, K, C_in)
-                    mapped_weight = v.detach().cpu().numpy().astype(dtype).transpose(0, 2, 1)
+                    mapped_weight = v.detach().cpu().numpy().astype(np_dtype).transpose(0, 2, 1)
                     mapped_dict[new_k] = mapped_weight
                     debug_print(f"Mapped {k} to {new_k} with transposition: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
                 else:
                     # Biases or other conv parameters
-                    mapped_dict[new_k] = v.detach().cpu().numpy().astype(dtype)
+                    mapped_dict[new_k] = v.detach().cpu().numpy().astype(np_dtype)
                     debug_print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
                 continue
             elif 'embed_positions' in new_k:
@@ -296,7 +404,7 @@ def map_state_dict(state_dict: Dict[str, torch.Tensor], dtype: np.dtype) -> Dict
 
         # Assign other weights directly
         if new_k not in mapped_dict:
-            mapped_dict[new_k] = v.detach().cpu().numpy().astype(dtype)
+            mapped_dict[new_k] = v.detach().cpu().numpy().astype(np_dtype)
             debug_print(f"Mapped {k} to {new_k}: shape {mapped_dict[new_k].shape}, dtype {mapped_dict[new_k].dtype}")
 
     # Identify any unmapped 'proj_out' parameters for debugging
@@ -304,7 +412,8 @@ def map_state_dict(state_dict: Dict[str, torch.Tensor], dtype: np.dtype) -> Dict
     if unmapped_proj_out:
         debug_print("Warning: The following 'proj_out' parameters were not specifically mapped and have been replaced with 'out':")
         for k in unmapped_proj_out:
-            debug_print(f"  Original key: {k} --> Mapped key: {k.replace('proj_out.', 'out.').replace('.proj_out', '.out').replace('proj_out', 'out')}")
+            mapped_k = k.replace('proj_out.', 'out.').replace('.proj_out', '.out').replace('proj_out', 'out')
+            debug_print(f"  Original key: {k} --> Mapped key: {mapped_k}")
 
     # Final Check: Ensure no 'proj_out' remains
     final_proj_out = [k for k in mapped_dict.keys() if 'proj_out' in k]
@@ -313,7 +422,41 @@ def map_state_dict(state_dict: Dict[str, torch.Tensor], dtype: np.dtype) -> Dict
 
     return mapped_dict
 
-def load_torch_model(name_or_path: str, download_root: str = None, dtype: mx.Dtype = mx.float16) -> CustomWhisper:
+def assert_dtypes(model, expected_dtype=mx.float16):
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            assert module.weight.dtype == expected_dtype, f"Linear layer '{name}.weight' is not {expected_dtype}."
+            if hasattr(module, 'bias') and module.bias is not None:
+                assert module.bias.dtype == expected_dtype, f"Linear layer '{name}.bias' is not {expected_dtype}."
+
+        elif isinstance(module, QuantizedLinear):
+            assert module.weight.dtype == mx.uint32, f"QuantizedLinear layer '{name}.weight' is not uint32."
+            assert module.scale.dtype == expected_dtype, f"QuantizedLinear layer '{name}.scale' is not {expected_dtype}."
+            if hasattr(module, 'bias') and module.bias is not None:
+                assert module.bias.dtype == expected_dtype, f"QuantizedLinear layer '{name}.bias' is not {expected_dtype}."
+
+        elif isinstance(module, FloatLayerNorm):
+            assert module.weight.dtype == expected_dtype, f"FloatLayerNorm layer '{name}.weight' is not {expected_dtype}."
+            assert module.bias.dtype == expected_dtype, f"FloatLayerNorm layer '{name}.bias' is not {expected_dtype}."
+
+        elif isinstance(module, nn.Conv1d):
+            assert module.weight.dtype == expected_dtype, f"Conv1d layer '{name}.weight' is not {expected_dtype}."
+            if hasattr(module, 'bias') and module.bias is not None:
+                assert module.bias.dtype == expected_dtype, f"Conv1d layer '{name}.bias' is not {expected_dtype}."
+
+        elif isinstance(module, nn.Embedding):
+            assert module.weight.dtype == expected_dtype, f"Embedding layer '{name}.weight' is not {expected_dtype}."
+
+        # Add additional layer types if necessary
+
+    # Check special buffers
+    assert model.encoder._positional_embedding.dtype == expected_dtype, "encoder._positional_embedding is not float16."
+    assert model.decoder.positional_embedding.dtype == expected_dtype, "decoder.positional_embedding is not float16."
+    assert model.decoder._mask.dtype == expected_dtype, "decoder._mask is not float16."
+
+
+
+def load_torch_model(name_or_path: str, download_root: str = None, np_dtype=np.float16, mx_dtype=mx.float16) -> CustomWhisper:
     def transpose_conv_weights(mapped_state_dict):
         # No transposition needed for Conv1d weights as it's handled in map_state_dict
         return mapped_state_dict
@@ -374,30 +517,33 @@ def load_torch_model(name_or_path: str, download_root: str = None, dtype: mx.Dty
     debug_print(f"Model Dimensions: {dims}")
 
     # Create a CustomWhisper model instance
-    debug_print("CustomWhisper initialized with:", dtype)
-    model = CustomWhisper(dims, dtype=dtype)
-    model = model.astype(dtype)  # Use the updated astype method
+    debug_print(f"CustomWhisper initialized with MLX dtype: {mx_dtype}")
+    model = CustomWhisper(dims, dtype=mx_dtype)
+    model = model.astype(mx_dtype)  # Use the updated astype method
 
+    verify_model_dtypes(model, expected_dtype=mx_dtype)
     debug_print(f"Number of mel bins (n_mels): {model.dims.n_mels}")
 
     # Map the state dict
-    np_dtype = np.float16 if dtype == mx.float16 else np.float32
     mapped_state_dict = map_state_dict(state_dict, np_dtype)
 
     # No transposition of convolutional weights (handled in map_state_dict)
     mapped_state_dict = transpose_conv_weights(mapped_state_dict)
 
+    debug_print("Replacing layer norms...")
+    replace_layer_norms(model, dtype=mx_dtype)
+
     # After mapping, check for any remaining 'proj_out' in the mapped keys
     remaining_proj_out = [k for k in mapped_state_dict.keys() if 'proj_out' in k]
     if remaining_proj_out:
-        debug_print("Warning: The following parameters still contain 'proj_out' and may not be correctly mapped:")
+        debug_print("Warning: The following 'proj_out' parameters still contain 'proj_out' and may not be correctly mapped:")
         for k in remaining_proj_out:
             debug_print(f"  {k}")
 
     # Convert numpy arrays to MLX arrays
     mlx_state_dict = {}
     for k, v in mapped_state_dict.items():
-        mlx_state_dict[k] = mx.array(v, dtype=dtype)
+        mlx_state_dict[k] = mx.array(v, dtype=mx_dtype)
         debug_print(f"Converted {k} to MLX array: shape {v.shape}, dtype {v.dtype}")
 
     # After creating the model instance
@@ -421,12 +567,12 @@ def load_torch_model(name_or_path: str, download_root: str = None, dtype: mx.Dty
 
     # Create dummy input with shape (batch_size, sequence_length, channels)
     dummy_input_length = 3000  # Must be <= n_audio_ctx
-    dummy_input = mx.random.normal((1, dummy_input_length, model.dims.n_mels))  # Shape: (1, 3000, 128)
+    dummy_input = mx.random.normal((1, dummy_input_length, model.dims.n_mels)).astype(mx_dtype)  # Shape: (1, 3000, 128)
     debug_print(f"Dummy input shape: {dummy_input.shape}")  # Should be (1, 3000, 128)
 
     # Verify input channels
     expected_in_channels = model.encoder.conv1.weight.shape[2]  # C_in=128
-    actual_in_channels = dummy_input.shape[2]  # C_in=128
+    actual_in_channels = dummy_input.shape[2]
     debug_print(f"Expected input channels: {expected_in_channels}, Actual input channels: {actual_in_channels}")
     if actual_in_channels != expected_in_channels:
         raise ValueError(f"Input channels mismatch: expected {expected_in_channels}, got {actual_in_channels}")
@@ -531,81 +677,112 @@ def set_submodule(parent_module, modules_list, module_to_set):
     else:
         raise TypeError(f"Unexpected type for parent_module: {type(parent_module)}")
 
-def quantize_model(model, group_size, bits):
-    """
-    Quantize linear layers in the model, except for those affecting audio_features.
-    """
+def verify_quantized_linear_weights(model, quantized_param_names):
+    for param_name in quantized_param_names:
+        weight = getattr(model, param_name, None)
+        if weight is None:
+            raise ValueError(f"QuantizedLinear layer's weight '{param_name}' not found in the model.")
+        if weight.dtype != mx.uint32:
+            raise TypeError(f"QuantizedLinear layer '{param_name}' has weight dtype {weight.dtype}, expected uint32.")
+        else:
+            debug_print(f"QuantizedLinear layer '{param_name}' weight dtype correctly set to {weight.dtype}.")
 
+
+def quantize_model(model, group_size, bits, main_dtype, np_dtype):
+    """
+    Quantize linear layers in the model using MLX's QuantizedLinear.from_linear(),
+    except for those affecting audio_features.
+
+    Parameters:
+    - model: The CustomWhisper model instance to be quantized.
+    - group_size (int): The group size for quantization.
+    - bits (int): The bit width for quantization.
+    - main_dtype (mx.Dtype): The target data type for non-quantized layers (e.g., mx.float16).
+    - np_dtype (np.dtype): The NumPy data type for scales (e.g., np.float16).
+
+    Returns:
+    - model: The quantized model instance.
+    """
     modules = list(model.named_modules())
 
-    # Early check
+    # Initial dtype verification before quantization
     debug_print("Before quantization:")
-    debug_model_dtypes(model)
+    verify_model_dtypes(model, expected_dtype=main_dtype)
 
     pbar = tqdm(total=len(modules), desc="Quantizing layers")
 
-    for name, module in modules:
+    for idx, (name, module) in enumerate(modules):
         # Define regex patterns for layers to skip quantization
         skip_patterns = [
+            r'^encoder\.blocks\.\d+\.attn\.key$',    # e.g., encoder.blocks.0.attn.key
+            r'^decoder\.blocks\.\d+\.attn\.key$',    # e.g., decoder.blocks.0.attn.key
             r'^encoder\.blocks\.\d+\.attn\.query$',  # e.g., encoder.blocks.0.attn.query
             r'^decoder\.blocks\.\d+\.attn\.query$',  # e.g., decoder.blocks.0.attn.query
+            r'^decoder\.token_embedding$',           # Skip token embedding layers
+            r'^encoder\.conv1$',                     # Example: encoder.conv1, adjust as needed
+            # Add more patterns to skip as necessary
         ]
 
         # Check if the current layer matches any skip pattern
         skip = any(re.match(pattern, name) for pattern in skip_patterns)
 
         if isinstance(module, nn.Linear) and not skip:
-            if 'decoder.token_embedding' in name:
-                pbar.update(1)
-                continue  # Skip quantization for token embedding
-
-            # Quantize this layer
-            weight = np.array(module.weight)
-            quantized_weights, scales = quantize_weights(weight, group_size, bits)
-            out_features, in_features = module.weight.shape
-
-            # Initialize QuantizedLinear with the same parameters
-            quantized_linear = QuantizedLinear(
-                in_features,
-                out_features,
+            # Quantize this Linear layer using QuantizedLinear.from_linear()
+            quantized_linear = QuantizedLinear.from_linear(
+                linear_layer=module,
                 group_size=group_size,
-                bits=bits,
-                bias=(hasattr(module, 'bias') and module.bias is not None)
+                bits=bits
             )
+            debug_print(f"QuantizedLinear layer '{name}' created from Linear layer.")
 
-            # Assign quantized weights and scales
-            quantized_linear.weight = mx.array(quantized_weights)
-            quantized_linear.scale = mx.array(scales, dtype=mx.float16)  # Changed to float16
-
-            # Assign biases if present
-            if hasattr(module, 'bias') and module.bias is not None:
-                quantized_linear.bias = mx.array(module.bias, dtype=mx.float16)  # Changed to float16
-
-            # Replace the original module with the quantized one
+            # Replace the original Linear layer with QuantizedLinear in the model
             modules_list = name.split('.')
             set_submodule(model, modules_list, quantized_linear)
+            debug_print(f"Replaced Linear layer '{name}' with QuantizedLinear.")
 
         pbar.update(1)
+
+        # Early validation after quantizing a certain number of layers
+        if (idx + 1) % 50 == 0:  # Adjust the frequency as needed
+            try:
+                dummy_input = mx.random.normal((1, 3000, model.dims.n_mels)).astype(main_dtype)
+                debug_print("Attempting audio features test with dummy input.")
+                audio_features = model.embed_audio(dummy_input)
+                if audio_features.dtype != main_dtype:
+                    raise TypeError(f"After quantizing {idx + 1} layers, audio_features dtype is {audio_features.dtype}, expected {main_dtype}.")
+                else:
+                    debug_print(f"Early validation passed after quantizing {idx + 1} layers.")
+            except TypeError as e:
+                pbar.close()
+                raise e
 
     pbar.close()
 
     debug_print("After quantization:")
-    debug_model_dtypes(model)
+    verify_model_dtypes(model, expected_dtype=main_dtype)
 
-    # Check if encoder output dtype is correct
-    dummy_input = mx.random.normal((1, model.dims.n_mels, 3000)).transpose(0, 2, 1)  # Shape: (1, 3000, 128)
-    encoder_output = model.encoder(dummy_input)
-    debug_print(f"Encoder output dtype: {encoder_output.dtype}")
+    # Reapply the astype method to ensure all modules are cast to main_dtype
+    debug_print("Reapplying astype to ensure all modules are cast to main_dtype after quantization.")
+    model = model.astype(main_dtype)
 
-    # Check audio features dtype
-    audio_features = model.embed_audio(dummy_input)
-    debug_print(f"Audio features dtype after quantization: {audio_features.dtype}")
+    # Final dtype check
+    try:
+        debug_print("Attempting final dtype check for audio features with dummy input.")
+        dummy_input = mx.random.normal((1, 3000, model.dims.n_mels)).astype(main_dtype)
+        audio_features = model.embed_audio(dummy_input)
+        if audio_features.dtype != main_dtype:
+            raise TypeError(f"After quantization, audio_features dtype is {audio_features.dtype}, expected {main_dtype}.")
+        else:
+            debug_print("Final dtype check passed.")
+    except TypeError as e:
+        raise e
 
     return model
 
-def quantize(model, args):
+def quantize(model, args, main_dtype, np_dtype):
+
     # Quantize the model:
-    quantized_model = quantize_model(model, args.q_group_size, args.q_bits)
+    quantized_model = quantize_model(model, args.q_group_size, args.q_bits, main_dtype=main_dtype, np_dtype=np_dtype)
 
     # Update the config:
     quantized_config = vars(quantized_model.dims)
@@ -621,10 +798,11 @@ def quantize(model, args):
         weights[key] = value
 
     debug_print("After quantization:")
-    debug_model_dtypes(quantized_model)
+    verify_model_dtypes(quantized_model, expected_dtype=main_dtype)
 
     # Check if encoder output dtype is correct
-    dummy_input = mx.random.normal((1, quantized_model.dims.n_mels, 3000)).transpose(0, 2, 1)  # (1, 3000, 80)
+    dummy_input = mx.random.normal((1, 3000, quantized_model.dims.n_mels)).astype(main_dtype)
+    debug_print("Generating encoder output with dummy input.")
     encoder_output = quantized_model.encoder(dummy_input)
     debug_print(f"Encoder output dtype: {encoder_output.dtype}")
 
@@ -633,6 +811,86 @@ def quantize(model, args):
     debug_print(f"Audio features dtype after quantization: {audio_features.dtype}")
 
     return weights, quantized_config
+
+def verify_model_dtypes(model, expected_dtype=mx.float16):
+    debug_print("Verifying model dtypes...")
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if module.weight.dtype != expected_dtype:
+                debug_print(f"Linear layer '{name}.weight' has dtype {module.weight.dtype}, expected {expected_dtype}.")
+            else:
+                debug_print(f"Linear layer '{name}.weight' correctly set to {expected_dtype}.")
+            
+            if hasattr(module, 'bias') and module.bias is not None:
+                if module.bias.dtype != expected_dtype:
+                    debug_print(f"Linear layer '{name}.bias' has dtype {module.bias.dtype}, expected {expected_dtype}.")
+                else:
+                    debug_print(f"Linear layer '{name}.bias' correctly set to {expected_dtype}.")
+
+        elif isinstance(module, QuantizedLinear):
+            if module.weight.dtype != mx.uint32:
+                debug_print(f"QuantizedLinear layer '{name}.weight' has dtype {module.weight.dtype}, expected uint32.")
+            else:
+                debug_print(f"QuantizedLinear layer '{name}.weight' correctly set to uint32.")
+            
+            if hasattr(module, 'bias') and module.bias is not None:
+                if module.bias.dtype != expected_dtype:
+                    debug_print(f"QuantizedLinear layer '{name}.bias' has dtype {module.bias.dtype}, expected {expected_dtype}.")
+                else:
+                    debug_print(f"QuantizedLinear layer '{name}.bias' correctly set to {expected_dtype}.")
+
+        elif isinstance(module, FloatLayerNorm):
+            if module.weight.dtype != expected_dtype:
+                debug_print(f"FloatLayerNorm layer '{name}.weight' has dtype {module.weight.dtype}, expected {expected_dtype}.")
+            else:
+                debug_print(f"FloatLayerNorm layer '{name}.weight' correctly set to {expected_dtype}.")
+            
+            if module.bias.dtype != expected_dtype:
+                debug_print(f"FloatLayerNorm layer '{name}.bias' has dtype {module.bias.dtype}, expected {expected_dtype}.")
+            else:
+                debug_print(f"FloatLayerNorm layer '{name}.bias' correctly set to {expected_dtype}.")
+
+        elif isinstance(module, nn.Conv1d):
+            if module.weight.dtype != expected_dtype:
+                debug_print(f"Conv1d layer '{name}.weight' has dtype {module.weight.dtype}, expected {expected_dtype}.")
+            else:
+                debug_print(f"Conv1d layer '{name}.weight' correctly set to {expected_dtype}.")
+            
+            if hasattr(module, 'bias') and module.bias is not None:
+                if module.bias.dtype != expected_dtype:
+                    debug_print(f"Conv1d layer '{name}.bias' has dtype {module.bias.dtype}, expected {expected_dtype}.")
+                else:
+                    debug_print(f"Conv1d layer '{name}.bias' correctly set to {expected_dtype}.")
+
+        elif isinstance(module, nn.Embedding):
+            if module.weight.dtype != expected_dtype:
+                debug_print(f"Embedding layer '{name}.weight' has dtype {module.weight.dtype}, expected {expected_dtype}.")
+            else:
+                debug_print(f"Embedding layer '{name}.weight' correctly set to {expected_dtype}.")
+
+        # Add additional layer types if necessary
+
+    # Check special buffers
+    if hasattr(model.encoder, '_positional_embedding'):
+        if model.encoder._positional_embedding.dtype != expected_dtype:
+            debug_print(f"encoder._positional_embedding has dtype {model.encoder._positional_embedding.dtype}, expected {expected_dtype}.")
+        else:
+            debug_print(f"encoder._positional_embedding correctly set to {expected_dtype}.")
+
+    if hasattr(model.decoder, 'positional_embedding'):
+        if model.decoder.positional_embedding.dtype != expected_dtype:
+            debug_print(f"decoder.positional_embedding has dtype {model.decoder.positional_embedding.dtype}, expected {expected_dtype}.")
+        else:
+            debug_print(f"decoder.positional_embedding correctly set to {expected_dtype}.")
+
+    if hasattr(model.decoder, '_mask'):
+        if model.decoder._mask.dtype != expected_dtype:
+            debug_print(f"decoder._mask has dtype {model.decoder._mask.dtype}, expected {expected_dtype}.")
+        else:
+            debug_print(f"decoder._mask correctly set to {expected_dtype}.")
+
+    debug_print("All dtypes verified.")
+
 
 def upload_to_hub(path: str, name: str, torch_name_or_path: str):
     """
@@ -651,10 +909,10 @@ library_name: mlx
 ---
 
 # {name}
-This model was converted to MLX format from [`{torch_name_or_path}`]().
+This model was converted to MLX format from [{torch_name_or_path}](). 
 
 ## Use with MLX
-```bash
+bash
 git clone https://github.com/ml-explore/mlx-examples.git
 cd mlx-examples/whisper/
 pip install -r requirements.txt
@@ -686,30 +944,33 @@ pip install -r requirements.txt
     except Exception as e:
         print(f"Failed to upload to Hugging Face Hub: {e}")
 
-if __name__ == "__main__":
-    
-    def test_encoder(model):
-        debug_print("Testing encoder...")
-        dummy_input_length = 3000
-        dummy_input = mx.random.normal((1, dummy_input_length, model.dims.n_mels))  # (1, 3000, 128)
-        debug_print(f"Original dummy input shape: {dummy_input.shape}")
 
-        # Verify input channels
-        expected_in_channels = model.encoder.conv1.weight.shape[2]
-        actual_in_channels = dummy_input.shape[2]
-        debug_print(f"Expected input channels: {expected_in_channels}, Actual input channels: {actual_in_channels}")
-        if actual_in_channels != expected_in_channels:
-            raise ValueError(f"Input channels mismatch: expected {expected_in_channels}, got {actual_in_channels}")
+def test_encoder(model):
+    debug_print("Testing encoder...")
+    dummy_input_length = 3000
+    dummy_input = mx.random.normal((1, dummy_input_length, model.dims.n_mels)).astype(model.dtype)
+    debug_print(f"Original dummy input shape: {dummy_input.shape}")
 
-        try:
-            encoder_output = model.encoder(dummy_input)
-            debug_print(f"Encoder output shape: {encoder_output.shape}")
-            debug_print("Encoder test successful!")
-        except Exception as e:
-            print(f"Encoder test failed: {str(e)}")
+    # Verify input channels
+    expected_in_channels = model.encoder.conv1.weight.shape[2]
+    actual_in_channels = dummy_input.shape[2]
+    debug_print(f"Expected input channels: {expected_in_channels}, Actual input channels: {actual_in_channels}")
+    if actual_in_channels != expected_in_channels:
+        raise ValueError(f"Input channels mismatch: expected {expected_in_channels}, got {actual_in_channels}")
 
-def main(): 
-    global VERBOSE
+    try:
+        encoder_output = model.embed_audio(dummy_input)
+        debug_print(f"Encoder output shape: {encoder_output.shape}")
+        debug_print(f"Encoder output dtype: {encoder_output.dtype}")
+        assert encoder_output.dtype == model.dtype, f"Encoder output dtype mismatch: {encoder_output.dtype} != {model.dtype}"
+        debug_print("Encoder test successful!")
+    except Exception as e:
+        print(f"Encoder test failed: {str(e)}")
+        raise e
+
+
+def main():
+
     parser = argparse.ArgumentParser(description="Convert Whisper weights to MLX.")
     parser.add_argument(
         "--torch-name-or-path",
@@ -760,21 +1021,22 @@ def main():
     )
 
     args = parser.parse_args()
+    
     VERBOSE = args.verbose
 
-    assert args.dtype in ["float16", "float32"], f"dtype {args.dtype} not supported"
-    dtype = getattr(mx, args.dtype)
-    debug_print(f"Using dtype: {dtype}")
+    # Correct dtype mapping
+    mx_dtype, np_dtype = get_dtype(args.dtype)
+    debug_print(f"Using MLX dtype: {mx_dtype}, NumPy dtype: {np_dtype}")
 
     print("[INFO] Loading")
-    model = load_torch_model(args.torch_name_or_path, dtype=dtype)
-    debug_model_dtypes(model)  # Updated from model.whisper to model
-
+    model = load_torch_model(args.torch_name_or_path, np_dtype=np_dtype, mx_dtype=mx_dtype)
+    debug_model_dtypes(model)
+    verify_model_dtypes(model, expected_dtype=mx_dtype)
     test_encoder(model)
 
     # Adjust the dummy input length to 3000
     dummy_input_length = 3000  # Adjusted to match input length that results in output length matching n_audio_ctx
-    dummy_input = mx.random.normal((1, dummy_input_length, model.dims.n_mels))  # Shape: (1, 3000, 128)
+    dummy_input = mx.random.normal((1, dummy_input_length, model.dims.n_mels)).astype(mx_dtype)  # Shape: (1, 3000, 128)
     debug_print(f"Dummy input shape: {dummy_input.shape}")  # Should be (1, 3000, 128)
 
     # Verify input channels
@@ -796,7 +1058,12 @@ def main():
 
     if args.quantize:
         print("[INFO] Quantizing")
-        weights, config = quantize(model, args)
+        model = quantize_model(model, args.q_group_size, args.q_bits, main_dtype=mx_dtype, np_dtype=np_dtype)
+
+        verify_model_dtypes(model, expected_dtype=mx_dtype)
+
+        weights, config = quantize(model, args, main_dtype=mx_dtype, np_dtype=np_dtype)
+
     else:
         # Collect the weights
         params_dict = model.parameters()
@@ -814,6 +1081,10 @@ def main():
     # Save config.json with model_type
     with open(os.path.join(mlx_path, "config.json"), "w") as f:
         config["model_type"] = "whisper"
+        config["quantization"] = {
+            "group_size": args.q_group_size,
+            "bits": args.q_bits,
+        }
         json.dump(config, f, indent=4)
 
     if args.upload_name is not None:
