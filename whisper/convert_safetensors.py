@@ -917,8 +917,10 @@ git clone https://github.com/ml-explore/mlx-examples.git
 cd mlx-examples/whisper/
 pip install -r requirements.txt
 
->> import whisper
->> whisper.transcribe("FILE_NAME")
+>> import mlx_whisper
+>> result = mlx_whisper.transcribe("test.mp3", path_or_hf_repo="mlx-community/{name}")
+>> print(result)
+
 """
     # Create README.md
     readme_path = os.path.join(path, "README.md")
