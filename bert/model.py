@@ -1,9 +1,13 @@
 import argparse
+import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy
+import numpy as np
 from mlx.utils import tree_unflatten
 from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerBase
 
@@ -122,10 +126,21 @@ def load_model(
 ) -> Tuple[Bert, PreTrainedTokenizerBase]:
     if not Path(weights_path).exists():
         raise ValueError(f"No model weights found in {weights_path}")
+    
+    # First check if there's a local config
+    config_path = Path(weights_path).parent / "config.json"
+    if config_path.exists():
+        with open(config_path, "r") as f:
+            config_dict = json.load(f)
+        config = AutoConfig.for_model(**config_dict)
+        print(f"Loaded local config from {config_path}")
+    else:
+        # If no local config, use the HuggingFace one
+        config = AutoConfig.from_pretrained(bert_model)
+        print(f"Loaded config from HuggingFace for {bert_model}")
 
-    config = AutoConfig.from_pretrained(bert_model)
-
-    # create and update the model
+    # Create and update the model
+    print(f"Creating model with vocab_size={config.vocab_size}, hidden_size={config.hidden_size}")
     model = Bert(config)
     model.load_weights(weights_path)
 
@@ -135,12 +150,33 @@ def load_model(
 
 
 def run(bert_model: str, mlx_model: str, batch: List[str]):
+    import time
+    
+    # Time model loading
+    load_start = time.time()
     model, tokenizer = load_model(bert_model, mlx_model)
-
+    load_time = time.time() - load_start
+    print(f"[MLX] Model loaded in {load_time:.2f} seconds")
+    
+    # Time tokenization
+    print(f"[MLX] Tokenizing batch of {len(batch)} sentences")
+    token_start = time.time()
     tokens = tokenizer(batch, return_tensors="np", padding=True)
+    token_time = time.time() - token_start
+    print(f"[MLX] Tokenization completed in {token_time:.4f} seconds")
+    
+    print(f"[MLX] Tokens shape: input_ids={tokens['input_ids'].shape}")
     tokens = {key: mx.array(v) for key, v in tokens.items()}
-
-    return model(**tokens)
+    
+    # Time inference
+    print(f"[MLX] Running model inference")
+    infer_start = time.time()
+    output, pooled = model(**tokens)
+    mx.eval(output, pooled)  # Force evaluation of lazy arrays
+    infer_time = time.time() - infer_start
+    print(f"[MLX] Inference completed in {infer_time:.4f} seconds")
+    
+    return output, pooled
 
 
 if __name__ == "__main__":
