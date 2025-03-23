@@ -1,7 +1,9 @@
 import argparse
+import os
+from pathlib import Path
 
 import numpy
-from transformers import AutoModel
+from transformers import AutoModel, AutoConfig
 
 
 def replace_key(key: str) -> str:
@@ -20,12 +22,29 @@ def replace_key(key: str) -> str:
 
 
 def convert(bert_model: str, mlx_model: str) -> None:
+    # Load model and its configuration
     model = AutoModel.from_pretrained(bert_model)
-    # save the tensors
+    config = AutoConfig.from_pretrained(bert_model)
+    
+    # Create output directory if it doesn't exist
+    output_dir = os.path.dirname(mlx_model)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # Save config as well
+    config_path = os.path.join(output_dir, "config.json")
+    with open(config_path, "w") as f:
+        f.write(config.to_json_string())
+        
+    print(f"Saved model config to {config_path}")
+    
+    # Save the tensors
     tensors = {
         replace_key(key): tensor.numpy() for key, tensor in model.state_dict().items()
     }
     numpy.savez(mlx_model, **tensors)
+    print(f"Saved model weights to {mlx_model}")
+    print(f"Model vocab size: {config.vocab_size}, hidden size: {config.hidden_size}")
 
 
 if __name__ == "__main__":
